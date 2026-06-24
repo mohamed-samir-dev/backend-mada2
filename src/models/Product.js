@@ -1,7 +1,10 @@
 const mongoose = require('mongoose');
 const slugify = require('slugify');
 
-const ALLOWED_CATEGORIES = ['living_room', 'bedroom', 'dining', 'office', 'outdoor', 'decor', 'packages'];
+const ALLOWED_CATEGORIES = [
+  'living_room', 'bedroom', 'dining', 'office', 'outdoor', 'decor', 'packages',
+  'furniture', 'pillows_bedding', 'air_conditioners', 'cameras', 'home_devices', 'tvs'
+];
 
 const productSchema = new mongoose.Schema({
   name: { type: String, required: [true, 'اسم المنتج مطلوب'], trim: true },
