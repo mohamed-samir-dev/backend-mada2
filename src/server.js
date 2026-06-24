@@ -44,7 +44,7 @@ app.use('/api/admin', adminRoutes);
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ success: true, message: 'مؤسسة هوملي للمفروشات المنزلية - API' });
+  res.json({ success: true, message: 'هوملي للمفروشات المنزلية - API' });
 });
 
 // 404

@@ -55,7 +55,7 @@ productSchema.pre('save', function (next) {
 
 
 // Indexes for performance
-productSchema.index({ slug: 1 });
+
 productSchema.index({ category: 1 });
 productSchema.index({ price: 1 });
 productSchema.index({ name: 'text', description: 'text' });
