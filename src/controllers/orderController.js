@@ -26,76 +26,114 @@ exports.createOrder = asyncHandler(async (req, res) => {
 
   const order = await Order.create({
     customerName, phone, address, notes, items: orderItems, totalPrice,
-    paymentMethod: paymentMethod === 'tap' ? 'tap' : 'cash_on_delivery'
+    paymentMethod: paymentMethod === 'online' ? 'online' : 'cash_on_delivery'
   });
 
   res.status(201).json({ success: true, message: 'تم إنشاء الطلب بنجاح', data: order });
 });
 
-// POST /api/orders/:id/tap-session - إنشاء جلسة دفع Tap
-exports.createTabbySession = asyncHandler(async (req, res) => {
+const MF_BASE = () => process.env.MYFATOORAH_BASE_URL || 'https://apitest.myfatoorah.com';
+const MF_TOKEN = () => process.env.MYFATOORAH_TOKEN;
+const mfHeaders = () => ({ 'Content-Type': 'application/json', 'Authorization': `Bearer ${MF_TOKEN()}` });
+
+// POST /api/orders/:id/myfatoorah-session
+exports.createMyFatoorahSession = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) throw new AppError('الطلب غير موجود', 404);
 
-  const nameParts = order.customerName.trim().split(' ');
-  const firstName = nameParts[0];
-  const lastName = nameParts.slice(1).join(' ') || firstName;
+  const grandTotal = Math.round(Number(order.totalPrice) * 1.15 * 100) / 100;
+  console.log('[MF] grandTotal:', grandTotal, '| token length:', MF_TOKEN()?.length, '| token start:', MF_TOKEN()?.slice(0, 30));
 
-  const response = await fetch('https://api.tap.company/v2/charges', {
+  if (!grandTotal || grandTotal <= 0) throw new AppError('قيمة الطلب غير صالحة', 400);
+  if (!MF_TOKEN()) throw new AppError('إعداد بوابة الدفع غير مكتمل', 500);
+
+  let initiateData;
+  try {
+    const initiateRes = await fetch(`${MF_BASE()}/v2/InitiatePayment`, {
+      method: 'POST',
+      headers: mfHeaders(),
+      body: JSON.stringify({ InvoiceAmount: grandTotal, CurrencyIso: 'SAR' })
+    });
+    const rawText = await initiateRes.text();
+    console.log('[MF Initiate RAW]', initiateRes.status, rawText.slice(0, 500));
+    initiateData = JSON.parse(rawText);
+    console.log('[MF Initiate]', JSON.stringify(initiateData, null, 2));
+  } catch (e) {
+    console.error('[MF Initiate ERROR]', e.message);
+    throw new AppError('فشل الاتصال بخادم الدفع', 500);
+  }
+
+  if (!initiateData.IsSuccess) throw new AppError(initiateData.Message || 'فشل تهيئة الدفع', 400);
+
+  const methods = initiateData.Data?.PaymentMethods;
+  const methodId = methods?.[0]?.PaymentMethodId ?? 1;
+  console.log('[MF] using methodId:', methodId);
+
+  let data;
+  try {
+    const executeRes = await fetch(`${MF_BASE()}/v2/ExecutePayment`, {
+      method: 'POST',
+      headers: mfHeaders(),
+      body: JSON.stringify({
+        PaymentMethodId: methodId,
+        InvoiceValue: grandTotal,
+        CurrencyIso: 'SAR',
+        CustomerName: order.customerName,
+        CustomerMobile: order.phone.replace(/^0/, ''),
+        CustomerEmail: `${order.phone}@homly.sa`,
+        CallBackUrl: `${process.env.FRONTEND_URL}/order-success?id=${order._id}&verify=mf`,
+        ErrorUrl: `${process.env.FRONTEND_URL}/checkout?error=payment_failed`,
+        Language: 'AR',
+        DisplayCurrencyIso: 'SAR',
+        UserDefinedField: order._id.toString()
+      })
+    });
+    data = await executeRes.json();
+    console.log('[MF Execute]', JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('[MF Execute ERROR]', e.message);
+    throw new AppError('فشل تنفيذ الدفع', 500);
+  }
+
+  if (!data.IsSuccess) {
+    throw new AppError(data.Message || data.ValidationErrors?.[0]?.Error || JSON.stringify(data), 400);
+  }
+
+  const payUrl = data.Data?.PaymentURL;
+  if (!payUrl) throw new AppError('لم يتم الحصول على رابط الدفع', 400);
+
+  order.mfInvoiceId = data.Data.InvoiceId;
+  order.paymentMethod = 'online';
+  await order.save();
+
+  res.json({ success: true, payUrl, invoiceId: data.Data.InvoiceId });
+});
+
+// GET /api/orders/:id/verify-payment?invoiceId=xxx
+exports.verifyPayment = asyncHandler(async (req, res) => {
+  const { invoiceId } = req.query;
+  const order = await Order.findById(req.params.id);
+  if (!order) throw new AppError('الطلب غير موجود', 404);
+
+  const response = await fetch(`${MF_BASE()}/v2/getPaymentStatus`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.TAP_SECRET_KEY}`
-    },
-    body: JSON.stringify({
-      amount: order.totalPrice,
-      currency: 'SAR',
-      customer: {
-        first_name: firstName,
-        last_name: lastName,
-        email: `${order.phone}@placeholder.com`,
-        phone: { country_code: '966', number: order.phone.replace(/^0/, '') }
-      },
-      source: { id: 'src_all' },
-      transaction: { timezone: 'Asia/Riyadh', created: new Date().toISOString() },
-      order: { id: order._id.toString(), currency: 'SAR', amount: order.totalPrice },
-      redirect: { url: `${process.env.FRONTEND_URL}/order-success?id=${order._id}&verify=true` },
-      post: { url: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/orders/${order._id}/tap-webhook` }
-    })
+    headers: mfHeaders(),
+    body: JSON.stringify({ Key: invoiceId, KeyType: 'InvoiceId' })
   });
 
   const data = await response.json();
+  if (!response.ok || !data.IsSuccess) throw new AppError('فشل التحقق من الدفع', 400);
 
-  if (!response.ok) throw new AppError(data.errors?.[0]?.description || data.message || 'فشل إنشاء جلسة الدفع', 400);
-
-  const checkoutUrl = data.transaction?.url;
-  if (!checkoutUrl) throw new AppError('لم يتم الحصول على رابط الدفع', 400);
-
-  res.json({ success: true, checkoutUrl, chargeId: data.id });
-});
-
-// GET /api/orders/:id/verify-payment?tap_id=xxx
-exports.verifyPayment = asyncHandler(async (req, res) => {
-  const { tap_id } = req.query;
-  const order = await Order.findById(req.params.id);
-  if (!order) throw new AppError('الطلب غير موجود', 404);
-
-  const response = await fetch(`https://api.tap.company/v2/charges/${tap_id}`, {
-    headers: { 'Authorization': `Bearer ${process.env.TAP_SECRET_KEY}` }
-  });
-
-  const charge = await response.json();
-
-  if (charge.status === 'CAPTURED') {
+  const invoiceStatus = data.Data?.InvoiceStatus;
+  if (invoiceStatus === 'Paid') {
     order.paymentStatus = 'paid';
-    order.tapChargeId = tap_id;
     order.status = 'confirmed';
     await order.save();
     res.json({ success: true, message: 'تم التحقق من الدفع بنجاح', data: order });
   } else {
     order.paymentStatus = 'failed';
     await order.save();
-    throw new AppError('فشل التحقق من الدفع', 400);
+    throw new AppError('لم يتم الدفع بعد', 400);
   }
 });
 
