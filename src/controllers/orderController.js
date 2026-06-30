@@ -49,15 +49,18 @@ exports.createMyFatoorahSession = asyncHandler(async (req, res) => {
 
   let initiateData;
   try {
+    const initiatePayload = { InvoiceAmount: grandTotal, CurrencyIso: 'SAR' };
+    console.log('[MF Initiate URL]', `${MF_BASE()}/v2/InitiatePayment`);
+    console.log('[MF Initiate Payload]', JSON.stringify(initiatePayload));
+    console.log('[MF Token Full]', MF_TOKEN());
     const initiateRes = await fetch(`${MF_BASE()}/v2/InitiatePayment`, {
       method: 'POST',
       headers: mfHeaders(),
-      body: JSON.stringify({ InvoiceAmount: grandTotal, CurrencyIso: 'SAR' })
+      body: JSON.stringify(initiatePayload)
     });
     const rawText = await initiateRes.text();
-    console.log('[MF Initiate RAW]', initiateRes.status, rawText.slice(0, 500));
+    console.log('[MF Initiate RAW]', initiateRes.status, rawText.slice(0, 1000));
     initiateData = JSON.parse(rawText);
-    console.log('[MF Initiate]', JSON.stringify(initiateData, null, 2));
   } catch (e) {
     console.error('[MF Initiate ERROR]', e.message);
     throw new AppError('فشل الاتصال بخادم الدفع', 500);
@@ -135,6 +138,113 @@ exports.verifyPayment = asyncHandler(async (req, res) => {
     await order.save();
     throw new AppError('لم يتم الدفع بعد', 400);
   }
+});
+
+const HP_BASE = () => process.env.HYPERPAY_BASE_URL || 'https://eu-test.oppwa.com';
+const HP_TOKEN = () => process.env.HYPERPAY_ACCESS_TOKEN;
+const HP_ENTITY_ID = () => process.env.HYPERPAY_ENTITY_ID;
+
+// POST /api/orders/:id/hyperpay-session
+exports.createHyperPaySession = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) throw new AppError('الطلب غير موجود', 404);
+
+  const grandTotal = (Math.round(Number(order.totalPrice) * 1.15 * 100) / 100).toFixed(2);
+  if (!grandTotal || Number(grandTotal) <= 0) throw new AppError('قيمة الطلب غير صالحة', 400);
+  if (!HP_TOKEN() || !HP_ENTITY_ID()) throw new AppError('إعداد بوابة HyperPay غير مكتمل', 500);
+
+  const nameParts = order.customerName.trim().split(' ');
+  const firstName = nameParts[0] || 'عميل';
+  const lastName = nameParts.slice(1).join(' ') || firstName;
+
+  const params = new URLSearchParams({
+    'entityId': HP_ENTITY_ID(),
+    'amount': grandTotal,
+    'currency': 'SAR',
+    'paymentType': 'DB',
+    'merchantTransactionId': order._id.toString(),
+    'customer.email': `${order.phone}@homly.sa`,
+    'customer.givenName': firstName,
+    'customer.surname': lastName,
+    'billing.street1': order.address,
+    'billing.city': 'الرياض',
+    'billing.state': 'الرياض',
+    'billing.country': 'SA',
+    'billing.postcode': '12345',
+    'customParameters[3DS2_enrolled]': 'true',
+    'testMode': 'EXTERNAL',
+  });
+
+  let checkoutData;
+  try {
+    const hpRes = await fetch(`${HP_BASE()}/v1/checkouts`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${HP_TOKEN()}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    });
+    checkoutData = await hpRes.json();
+    console.log('[HyperPay Checkout]', JSON.stringify(checkoutData, null, 2));
+  } catch (e) {
+    console.error('[HyperPay ERROR]', e.message);
+    throw new AppError('فشل الاتصال بخادم HyperPay', 500);
+  }
+
+  const resultCode = checkoutData?.result?.code;
+  if (!resultCode || !resultCode.startsWith('000.200')) {
+    throw new AppError(checkoutData?.result?.description || 'فشل إنشاء جلسة HyperPay', 400);
+  }
+
+  order.hyperPayCheckoutId = checkoutData.id;
+  order.paymentMethod = 'online';
+  await order.save();
+
+  res.json({ success: true, checkoutId: checkoutData.id });
+});
+
+// GET /api/orders/:id/verify-hyperpay?resourcePath=xxx
+exports.verifyHyperPayment = asyncHandler(async (req, res) => {
+  const { resourcePath } = req.query;
+  const order = await Order.findById(req.params.id);
+  if (!order) throw new AppError('الطلب غير موجود', 404);
+  if (!resourcePath) throw new AppError('resourcePath مطلوب', 400);
+
+  let paymentData;
+  try {
+    const hpRes = await fetch(`${HP_BASE()}${resourcePath}?entityId=${HP_ENTITY_ID()}`, {
+      headers: { 'Authorization': `Bearer ${HP_TOKEN()}` },
+    });
+    paymentData = await hpRes.json();
+    console.log('[HyperPay Verify]', JSON.stringify(paymentData, null, 2));
+  } catch (e) {
+    console.error('[HyperPay Verify ERROR]', e.message);
+    throw new AppError('فشل التحقق من الدفع', 500);
+  }
+
+  const code = paymentData?.result?.code;
+  const isSuccess = code && (/^(000\.000\.|000\.100\.1|000\.[36])/.test(code));
+
+  if (isSuccess) {
+    order.paymentStatus = 'paid';
+    order.status = 'confirmed';
+    await order.save();
+    res.json({ success: true, message: 'تم التحقق من الدفع بنجاح', data: order });
+  } else {
+    order.paymentStatus = 'failed';
+    await order.save();
+    throw new AppError(paymentData?.result?.description || 'لم يتم الدفع', 400);
+  }
+});
+
+// GET /api/orders/:id/receipt (public - for invoice page)
+exports.getOrderPublic = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id)
+    .select('customerName phone address notes items totalPrice paymentMethod paymentStatus status createdAt')
+    .lean();
+  if (!order) throw new AppError('الطلب غير موجود', 404);
+  res.json({ success: true, data: order });
 });
 
 // GET /api/orders (admin)
