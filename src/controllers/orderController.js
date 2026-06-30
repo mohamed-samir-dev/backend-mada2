@@ -41,7 +41,7 @@ exports.createMyFatoorahSession = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) throw new AppError('الطلب غير موجود', 404);
 
-  const grandTotal = Math.round(Number(order.totalPrice) * 1.15 * 100) / 100;
+  const grandTotal = Math.round(Number(order.totalPrice) * 100) / 100;
   console.log('[MF] grandTotal:', grandTotal, '| token length:', MF_TOKEN()?.length, '| token start:', MF_TOKEN()?.slice(0, 30));
 
   if (!grandTotal || grandTotal <= 0) throw new AppError('قيمة الطلب غير صالحة', 400);
@@ -149,7 +149,7 @@ exports.createHyperPaySession = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) throw new AppError('الطلب غير موجود', 404);
 
-  const grandTotal = (Math.round(Number(order.totalPrice) * 1.15 * 100) / 100).toFixed(2);
+  const grandTotal = (Math.round(Number(order.totalPrice) * 100) / 100).toFixed(2);
   if (!grandTotal || Number(grandTotal) <= 0) throw new AppError('قيمة الطلب غير صالحة', 400);
   if (!HP_TOKEN() || !HP_ENTITY_ID()) throw new AppError('إعداد بوابة HyperPay غير مكتمل', 500);
 
